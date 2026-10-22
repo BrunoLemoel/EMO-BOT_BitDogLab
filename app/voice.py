@@ -14,8 +14,11 @@ def listen_once() -> str:
             log("Adjusting for ambient noise...", "info")
             recognizer.adjust_for_ambient_noise(source, duration=1)
             log("Listening... Speak now!", "info")
-            audio = recognizer.listen(source, timeout=8)
-            text = recognizer.recognize_google(audio)
+            audio = recognizer.listen(source, timeout=8, phrase_time_limit=10)
+            try:
+                text = recognizer.recognize_google(audio, language="pt-BR")
+            except Exception:
+                text = recognizer.recognize_google(audio)
             log(f"You said: {text}", "user")
             return text
     except sr.WaitTimeoutError:

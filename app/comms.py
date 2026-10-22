@@ -28,12 +28,31 @@ tts_engine.setProperty('volume', 1.0)
 _tts_lock = threading.Lock()
 
 
+def speak_pc(text: str):
+    """Speak text on the computer speakers via local TTS."""
+    def _worker():
+        try:
+            with _tts_lock:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 155)
+                engine.setProperty('volume', 1.0)
+                engine.say(text)
+                engine.runAndWait()
+        except Exception as e:
+            log(f"PC TTS error: {e}", "warning")
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 # =============================================
 #  DISPATCH
 # =============================================
 def send_command(cmd: str, conn_mode: str) -> str:
-    """Send command to ESP32 via the given connection mode."""
+    """Send command to robot via the given connection mode."""
     try:
+        # Se WiFi foi selecionado mas não há IP, e a USB Serial está conectada, roteia para USB
+        if conn_mode == "WiFi" and not config.esp32_ip and config.serial_conn and config.serial_conn.is_open:
+            return send_serial(cmd)
+
         if conn_mode == "WiFi":
             return send_wifi(cmd)
         elif conn_mode == "USB Serial":
@@ -62,6 +81,21 @@ def send_wifi(cmd: str) -> str:
             r = requests.get(f"http://{ip}/servo",
                              params={"angle": cmd[6:]}, timeout=5)
             return r.text
+        elif cmd.startswith("EXPR:"):
+            r = requests.get(f"http://{ip}/expr",
+                             params={"expr": cmd[5:]}, timeout=5)
+            return r.text
+        elif cmd.startswith("ALL:"):
+            parts = cmd[4:].split(":", 1)
+            expr = parts[0]
+            text = parts[1] if len(parts) > 1 else ""
+            r = requests.get(f"http://{ip}/all",
+                             params={"expr": expr, "text": text}, timeout=5)
+            return r.text
+        elif cmd == "BLINK":
+            r = requests.get(f"http://{ip}/expr",
+                             params={"expr": "blink"}, timeout=5)
+            return r.text
         elif cmd.startswith("BOTH:"):
             parts = cmd[5:].split(":", 1)
             angle = parts[0]
@@ -75,8 +109,6 @@ def send_wifi(cmd: str) -> str:
         elif cmd == "STATUS":
             r = requests.get(f"http://{ip}/status", timeout=5)
             return r.text
-        elif cmd.startswith("AUDIO:"):
-            return send_audio_wifi(cmd[6:])
     except requests.exceptions.Timeout:
         return "ERROR: WiFi timeout"
     except requests.exceptions.ConnectionError:
@@ -134,12 +166,16 @@ def send_serial(cmd: str) -> str:
         return "ERROR: Serial not connected. Click 'Connect USB' first."
 
     try:
+        config.serial_conn.reset_input_buffer()
         config.serial_conn.write((cmd + "\n").encode())
-        time.sleep(0.3)
+        time.sleep(0.15)
         response = ""
         while config.serial_conn.in_waiting:
-            response += config.serial_conn.readline().decode(errors="ignore")
-        return response.strip() or "Sent"
+            line = config.serial_conn.readline().decode(errors="ignore")
+            response += line
+            if "\n" in line:
+                break
+        return response.strip() or "OK"
     except Exception as e:
         disconnect_serial()
         return f"ERROR: {e}"
@@ -149,8 +185,10 @@ def connect_serial(port: str, baud: int):
     """Connect to a serial port. Returns (success, message)."""
     disconnect_serial()  # Close any existing connection first
     try:
-        config.serial_conn = serial.Serial(port, baud, timeout=3)
-        time.sleep(2)
+        config.serial_conn = serial.Serial(port, baud, timeout=2)
+        config.serial_conn.dtr = True
+        config.serial_conn.rts = True
+        time.sleep(1)
         return True, f"USB Serial connected: {port} @ {baud}"
     except Exception as e:
         config.serial_conn = None

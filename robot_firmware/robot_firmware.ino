@@ -25,8 +25,8 @@
 // =============================================
 //  WiFi CREDENTIALS — CHANGE THESE
 // =============================================
-const char* ssid     = "A.K";
-const char* password = "pika1234";
+const char* ssid     = "AT-VISITANTE";
+const char* password = "ATL%940308!";
 
 // =============================================
 //  DISPLAY (U8g2)

@@ -1,6 +1,6 @@
 """
 Gemini AI integration for the AI Robot Dashboard.
-Uses gemini-2.0-flash (the current available model).
+Uses gemini-3.8-flash (the current available model).
 """
 import google.generativeai as genai
 import time
@@ -45,8 +45,8 @@ def init_gemini():
         return False
     try:
         genai.configure(api_key=config.GEMINI_API_KEY)
-        config.gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-        log("Gemini AI connected! (gemini-2.0-flash)", "success")
+        config.gemini_model = genai.GenerativeModel("gemini-3.8-flash")
+        log("Gemini AI connected! (gemini-3.8-flash)", "success")
         return True
     except Exception as e:
         log(f"Gemini error: {e}", "error")

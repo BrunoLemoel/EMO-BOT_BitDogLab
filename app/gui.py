@@ -17,7 +17,7 @@ from app import config
 from app.logger import log
 from app.comms import (
     send_command, connect_serial, disconnect_serial,
-    list_serial_ports, auto_detect_bt_mac
+    list_serial_ports, auto_detect_bt_mac, speak_pc
 )
 from app.gemini_ai import init_gemini, ask_gemini
 from app.voice import listen_once
@@ -81,7 +81,7 @@ def build_app():
     ctk.CTkLabel(left, text="📡 CONNECTION MODE",
                  font=("Consolas", 11, "bold"),
                  text_color="#888888").pack(anchor="w", padx=15, pady=(15, 2))
-    conn_mode_var = ctk.StringVar(value="WiFi")
+    conn_mode_var = ctk.StringVar(value="USB Serial")
     for mode in config.CONNECTION_MODES:
         ctk.CTkRadioButton(left, text=mode, variable=conn_mode_var,
                            value=mode).pack(anchor="w", padx=30, pady=1)
@@ -154,9 +154,11 @@ def build_app():
             ok, msg = connect_serial(port, baud)
             if ok:
                 log(msg, "success")
-                serial_status.configure(text="● Connected", text_color="#00ff88")
+                conn_mode_var.set("USB Serial")
+                serial_status.configure(text=f"● Connected ({port})", text_color="#00ff88")
             else:
                 log(msg, "error")
+                serial_status.configure(text="● Connection Failed", text_color="#ff4444")
         threading.Thread(target=_worker, daemon=True).start()
 
     def do_disconnect_serial():
@@ -294,64 +296,108 @@ def build_app():
     mic_btn_row.pack(fill="x", padx=10, pady=(0, 10))
 
     def mic_stream_worker():
-        """Continuously poll ESP32 /mic_stream and transcribe."""
+        """Continuously listen and transcribe (via ESP32 WiFi if configured, or local PC mic)."""
         recognizer = sr.Recognizer()
-        audio_buffer = b""
-        chunk_count = 0
 
-        while mic_streaming["active"]:
-            try:
-                ip = config.esp32_ip
-                if not ip:
-                    log("Robot Mic: Set WiFi IP first", "warning")
+        if config.esp32_ip and conn_mode_var.get() == "WiFi":
+            # Mode A: Poll ESP32 WiFi stream
+            audio_buffer = b""
+            chunk_count = 0
+            while mic_streaming["active"]:
+                try:
+                    r = requests.get(f"http://{config.esp32_ip}/mic_stream", timeout=3)
+                    if r.status_code != 200:
+                        continue
+
+                    audio_buffer += r.content
+                    chunk_count += 1
+
+                    if chunk_count >= 4:
+                        try:
+                            wav_io = io.BytesIO()
+                            with wave.open(wav_io, 'wb') as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(16000)
+                                wf.writeframes(audio_buffer)
+                            wav_io.seek(0)
+
+                            audio_data = sr.AudioFile(wav_io)
+                            with audio_data as source:
+                                audio = recognizer.record(source)
+
+                            try:
+                                text = recognizer.recognize_google(audio, language="pt-BR")
+                            except Exception:
+                                text = recognizer.recognize_google(audio)
+
+                            if text:
+                                log(f"Robot heard: {text}", "user")
+                                transcript_box.configure(state="normal")
+                                transcript_box.insert("end", text + "\n")
+                                transcript_box.see("end")
+                                transcript_box.configure(state="disabled")
+
+                                if message_mode_var.get() == "AI":
+                                    threading.Thread(target=process_input,
+                                                     args=(text,), daemon=True).start()
+                                else:
+                                    threading.Thread(target=process_direct,
+                                                     args=(text,), daemon=True).start()
+                        except sr.UnknownValueError:
+                            pass
+                        except Exception as e:
+                            log(f"Transcription error: {e}", "warning")
+
+                        audio_buffer = b""
+                        chunk_count = 0
+
+                except requests.exceptions.Timeout:
+                    continue
+                except requests.exceptions.ConnectionError:
+                    log("Robot Mic: Lost connection to ESP32", "error")
+                    break
+                except Exception as e:
+                    log(f"Mic stream error: {e}", "error")
                     break
 
-                r = requests.get(f"http://{ip}/mic_stream", timeout=3)
-                if r.status_code != 200:
-                    continue
+        else:
+            # Mode B: Continuous Live Listening via PC Microphone
+            log("Live Mic: Listening continuously via PC Microphone...", "info")
+            try:
+                with sr.Microphone() as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.8)
+                    while mic_streaming["active"]:
+                        try:
+                            audio = recognizer.listen(source, timeout=3, phrase_time_limit=8)
+                            try:
+                                text = recognizer.recognize_google(audio, language="pt-BR")
+                            except Exception:
+                                text = recognizer.recognize_google(audio)
 
-                audio_buffer += r.content
-                chunk_count += 1
+                            if text and text.strip():
+                                log(f"Live Mic heard: {text}", "user")
+                                transcript_box.configure(state="normal")
+                                transcript_box.insert("end", text + "\n")
+                                transcript_box.see("end")
+                                transcript_box.configure(state="disabled")
 
-                # Transcribe every 4 chunks (~2 seconds of audio)
-                if chunk_count >= 4:
-                    try:
-                        # Wrap raw PCM into a WAV for speech_recognition
-                        wav_io = io.BytesIO()
-                        with wave.open(wav_io, 'wb') as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)  # 16-bit
-                            wf.setframerate(16000)
-                            wf.writeframes(audio_buffer)
-                        wav_io.seek(0)
-
-                        audio_data = sr.AudioFile(wav_io)
-                        with audio_data as source:
-                            audio = recognizer.record(source)
-
-                        text = recognizer.recognize_google(audio)
-                        if text:
-                            log(f"Robot heard: {text}", "user")
-                            transcript_box.configure(state="normal")
-                            transcript_box.insert("end", text + "\n")
-                            transcript_box.see("end")
-                            transcript_box.configure(state="disabled")
-                    except sr.UnknownValueError:
-                        pass  # silence, skip
-                    except Exception as e:
-                        log(f"Transcription error: {e}", "warning")
-
-                    audio_buffer = b""
-                    chunk_count = 0
-
-            except requests.exceptions.Timeout:
-                continue
-            except requests.exceptions.ConnectionError:
-                log("Robot Mic: Lost connection to ESP32", "error")
-                break
+                                if message_mode_var.get() == "AI":
+                                    threading.Thread(target=process_input,
+                                                     args=(text,), daemon=True).start()
+                                else:
+                                    threading.Thread(target=process_direct,
+                                                     args=(text,), daemon=True).start()
+                        except sr.WaitTimeoutError:
+                            continue
+                        except sr.UnknownValueError:
+                            continue
+                        except Exception as e:
+                            if mic_streaming["active"]:
+                                log(f"Live Mic recognition error: {e}", "warning")
+                            time.sleep(0.5)
             except Exception as e:
-                log(f"Mic stream error: {e}", "error")
-                break
+                log(f"Microphone init error: {e}", "error")
 
         mic_streaming["active"] = False
         mic_status_label.configure(text="● Stopped", text_color="#ff4444")
@@ -382,55 +428,44 @@ def build_app():
                   command=clear_transcript,
                   fg_color="#333333").pack(side="left")
 
-    # -- Servo Control --
-    servo_frame = ctk.CTkFrame(right, fg_color="#0d1117")
-    servo_frame.pack(fill="x", padx=10, pady=(0, 5))
+    # -- BitDogLab Expression Controls --
+    expr_frame = ctk.CTkFrame(right, fg_color="#0d1117")
+    expr_frame.pack(fill="x", padx=10, pady=(0, 5))
 
-    ctk.CTkLabel(servo_frame, text="🔄 SERVO ANGLE CONTROL",
+    ctk.CTkLabel(expr_frame, text="🎭 BITDOGLAB EXPRESSÕES & EFEITOS",
                  font=("Consolas", 12, "bold"),
-                 text_color="#ffaa00").pack(anchor="w", padx=10, pady=(10, 2))
+                 text_color="#00ffcc").pack(anchor="w", padx=10, pady=(10, 2))
 
-    slider_row = ctk.CTkFrame(servo_frame, fg_color="transparent")
-    slider_row.pack(fill="x", padx=10, pady=(0, 10))
+    quick_row1 = ctk.CTkFrame(expr_frame, fg_color="transparent")
+    quick_row1.pack(fill="x", padx=10, pady=(2, 4))
+    quick_row2 = ctk.CTkFrame(expr_frame, fg_color="transparent")
+    quick_row2.pack(fill="x", padx=10, pady=(0, 10))
 
-    angle_slider = ctk.CTkSlider(slider_row, from_=0, to=180,
-                                  number_of_steps=180, width=300)
-    angle_slider.set(90)
-    angle_slider.pack(side="left", padx=(0, 10))
-
-    angle_label = ctk.CTkLabel(slider_row, text="90°",
-                                font=("Consolas", 14, "bold"),
-                                text_color="#ffaa00", width=50)
-    angle_label.pack(side="left")
-
-    def update_angle_label(val):
-        angle_label.configure(text=f"{int(float(val))}°")
-
-    angle_slider.configure(command=update_angle_label)
-
-    def send_servo_angle():
+    def send_quick_expr(e):
         def _worker():
-            angle = int(angle_slider.get())
-            result = send_command(f"SERVO:{angle}", conn_mode_var.get())
-            log(f"Servo set to {angle}°: {result}", "info")
+            mode = "USB Serial" if (config.serial_conn and config.serial_conn.is_open) else conn_mode_var.get()
+            if e in ["BLINK", "FLIP", "STANDBY"]:
+                res = send_command(e, mode)
+                log(f"BitDogLab {e}: {res}", "info")
+            else:
+                res = send_command(f"EXPR:{e}", mode)
+                log(f"BitDogLab [{e}]: {res}", "success")
         threading.Thread(target=_worker, daemon=True).start()
 
-    ctk.CTkButton(slider_row, text="Set Servo", width=100,
-                  command=send_servo_angle,
-                  fg_color="#7d5a00").pack(side="left", padx=10)
+    row1_emotions = [("Normal", "normal"), ("Feliz 😊", "happy"), ("Triste 😢", "sad"),
+                     ("Bravo 😠", "angry"), ("Amor ❤️", "love"), ("Surpreso 😲", "surprised"),
+                     ("Onda 🌈", "wave")]
+    for label, emo in row1_emotions:
+        ctk.CTkButton(quick_row1, text=label, width=72, height=26,
+                      command=lambda e=emo: send_quick_expr(e)).pack(side="left", padx=2)
 
-    quick_frame = ctk.CTkFrame(servo_frame, fg_color="transparent")
-    quick_frame.pack(fill="x", padx=10, pady=(0, 10))
-    for angle in [0, 45, 90, 135, 180]:
-        def quick_servo(a=angle):
-            def _worker():
-                angle_slider.set(a)
-                angle_label.configure(text=f"{a}°")
-                send_command(f"SERVO:{a}", conn_mode_var.get())
-                log(f"Quick servo: {a}°", "info")
-            threading.Thread(target=_worker, daemon=True).start()
-        ctk.CTkButton(quick_frame, text=f"{angle}°", width=60,
-                      command=quick_servo).pack(side="left", padx=3)
+    row2_emotions = [("Pensando 🤔", "thinking"), ("Piscada 😉", "wink"),
+                     ("Sono 😴", "sleepy"), ("Confuso ❓", "confused"),
+                     ("Piscar Olhos", "BLINK"), ("Girar 🔄", "FLIP"),
+                     ("Standby 💤", "STANDBY")]
+    for label, emo in row2_emotions:
+        ctk.CTkButton(quick_row2, text=label, width=74, height=26, fg_color="#2b3b4c",
+                      command=lambda e=emo: send_quick_expr(e)).pack(side="left", padx=2)
 
     # -- Activity Log --
     log_frame = ctk.CTkFrame(right, fg_color="#0d1117")
@@ -472,12 +507,10 @@ def build_app():
         response_box.insert(tk.END, f"[Direct Message] {text}")
         response_box.configure(state="disabled")
 
-        angle = detect_direction(text)
-        angle_slider.set(angle)
-
-        cmd    = f"BOTH:{angle}:{text}"
+        cmd    = f"MSG:{text}"
         result = send_command(cmd, conn_mode_var.get())
-        log(f"ESP32 response: {result}", "info")
+        log(f"BitDogLab response: {result}", "info")
+        speak_pc(text)
 
     def process_input(text: str):
         log("Asking Gemini...", "info")
@@ -489,17 +522,13 @@ def build_app():
         response_box.insert(tk.END, f"[{emotion}] {ai_response}")
         response_box.configure(state="disabled")
 
-        angle = detect_direction(text)
-        angle_slider.set(angle)
-
-        # Send ALL command: servo + emotion + text
-        cmd    = f"ALL:{angle}:{emotion}:{ai_response}"
+        # Send command to BitDogLab (emotion + text, no servo)
+        cmd    = f"ALL:{emotion}:{ai_response}"
         result = send_command(cmd, conn_mode_var.get())
-        log(f"ESP32 response: {result}", "info")
+        log(f"BitDogLab response: {result}", "info")
 
-        if conn_mode_var.get() == "WiFi":
-            audio_res = send_command(f"AUDIO:{ai_response}", conn_mode_var.get())
-            log(f"ESP32 Audio Result: {audio_res}", "info")
+        # Speak answer locally on PC speakers
+        speak_pc(ai_response)
 
     def send_manual():
         text = user_input.get().strip()
